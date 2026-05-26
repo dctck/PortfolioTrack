@@ -477,15 +477,22 @@ async function fetchQuote(ticker){
     return priceCache[ticker];
   }
   try {
-    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_KEY}`);
-    const d = await r.json();
-    if(!d || d.c === undefined) return null;
+    // price data from Finnhub
+    const [fRes, yRes] = await Promise.all([
+      fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_KEY}`),
+      fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5d`)
+    ]);
+    const f = await fRes.json();
+    const y = await yRes.json();
+    const meta = y.chart?.result?.[0]?.meta;
+
+    if(!f || f.c === undefined) return null;
     const quote = {
-      price: d.c,
-      prev: d.pc,
-      change: d.c - d.pc,
-      changePct: d.pc > 0 ? ((d.c - d.pc) / d.pc) * 100 : 0,
-      name: ticker
+      price: f.c,
+      prev: f.pc,
+      change: f.c - f.pc,
+      changePct: f.pc > 0 ? ((f.c - f.pc) / f.pc) * 100 : 0,
+      name: meta?.shortName || meta?.longName || ticker
     };
     priceCache[ticker] = quote;
     priceCacheTime[ticker] = now;
@@ -494,17 +501,19 @@ async function fetchQuote(ticker){
   } catch(e){ return null; }
 }
 
+
 async function fetchHistory(ticker, range){
-  const resMap = {'1W':'D','1M':'D','3M':'D','1Y':'W','ALL':'M'};
-  const daysBack = {'1W':7,'1M':30,'3M':90,'1Y':365,'ALL':1825};
-  const res = resMap[range]||'D';
-  const from = Math.floor((Date.now() - daysBack[range]*86400000) / 1000);
-  const to = Math.floor(Date.now() / 1000);
+  const rangeMap = {'1W':'5d','1M':'1mo','3M':'3mo','1Y':'1y','ALL':'5y'};
+  const intMap = {'1W':'1d','1M':'1d','3M':'1d','1Y':'1wk','ALL':'1mo'};
   try {
-    const r = await fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(ticker)}&resolution=${res}&from=${from}&to=${to}&token=${FINNHUB_KEY}`);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${intMap[range]||'1d'}&range=${rangeMap[range]||'5d'}`;
+    const r = await fetch(url);
     const d = await r.json();
-    if(!d || d.s !== 'ok') return [];
-    return d.t.map((t,i) => ({t: new Date(t*1000), v: d.c[i]}));
+    const result = d.chart?.result?.[0];
+    if(!result) return [];
+    const ts = result.timestamp || [];
+    const closes = result.indicators?.quote?.[0]?.close || [];
+    return ts.map((t,i) => ({t: new Date(t*1000), v: closes[i]||null})).filter(x=>x.v!==null);
   } catch(e){ return []; }
 }
 
