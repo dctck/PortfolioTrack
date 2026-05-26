@@ -860,7 +860,7 @@ async function selectTicker(ticker, name){
   }
 }
 
-function submitTx(){
+async function submitTx(){
   const type = currentTxType;
   let ticker, name;
   if(type==='buy'){
