@@ -469,7 +469,7 @@ function getAvgCost(ticker){
 }
 
 // ─── YAHOO FINANCE PROXY ─────────────────────────────────────────────────────
-const PROXY = 'https://corsproxy.io/?url=';
+const FINNHUB_KEY = 'd8auq31r01qk20sotit0d8auq31r01qk20sotitg';
 
 async function fetchQuote(ticker){
   const now = Date.now();
@@ -477,26 +477,15 @@ async function fetchQuote(ticker){
     return priceCache[ticker];
   }
   try {
-    const base = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=max&events=split`;
-    const url = PROXY + encodeURIComponent(base);
-    const r = await fetch(url);
+    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_KEY}`);
     const d = await r.json();
-    const result = d.chart?.result?.[0];
-    if(!result) return null;
-    const meta = result.meta;
-
-    // get ALL splits and compute total cumulative multiplier
-    const splits = result.events?.splits ? Object.values(result.events.splits) : [];
-    let splitMultiplier = 1;
-    splits.forEach(s => { splitMultiplier *= (s.numerator / s.denominator); });
-
+    if(!d || d.c === undefined) return null;
     const quote = {
-      price: meta.regularMarketPrice || meta.previousClose || 0,
-      prev: meta.previousClose || meta.chartPreviousClose || 0,
-      change: (meta.regularMarketPrice||0) - (meta.previousClose||0),
-      changePct: meta.regularMarketChangePercent || 0,
-      name: meta.shortName || meta.longName || ticker,
-      splitMultiplier
+      price: d.c,
+      prev: d.pc,
+      change: d.c - d.pc,
+      changePct: d.pc > 0 ? ((d.c - d.pc) / d.pc) * 100 : 0,
+      name: ticker
     };
     priceCache[ticker] = quote;
     priceCacheTime[ticker] = now;
@@ -506,31 +495,27 @@ async function fetchQuote(ticker){
 }
 
 async function fetchHistory(ticker, range){
-  const rangeMap = {'1W':'5d','1M':'1mo','3M':'3mo','1Y':'1y','ALL':'5y'};
-  const intMap = {'1W':'1d','1M':'1d','3M':'1d','1Y':'1wk','ALL':'1mo'};
-  const r2 = rangeMap[range]||'5d';
-  const i2 = intMap[range]||'1d';
+  const resMap = {'1W':'D','1M':'D','3M':'D','1Y':'W','ALL':'M'};
+  const daysBack = {'1W':7,'1M':30,'3M':90,'1Y':365,'ALL':1825};
+  const res = resMap[range]||'D';
+  const from = Math.floor((Date.now() - daysBack[range]*86400000) / 1000);
+  const to = Math.floor(Date.now() / 1000);
   try {
-    const url = PROXY + encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${i2}&range=${r2}`);
-    const r = await fetch(url);
+    const r = await fetch(`https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(ticker)}&resolution=${res}&from=${from}&to=${to}&token=${FINNHUB_KEY}`);
     const d = await r.json();
-    const result = d.chart?.result?.[0];
-    if(!result) return [];
-    const ts = result.timestamp || [];
-    const closes = result.indicators?.quote?.[0]?.close || [];
-    return ts.map((t,i) => ({t: new Date(t*1000), v: closes[i]||null})).filter(x=>x.v!==null);
+    if(!d || d.s !== 'ok') return [];
+    return d.t.map((t,i) => ({t: new Date(t*1000), v: d.c[i]}));
   } catch(e){ return []; }
 }
 
-async function searchYahoo(q){
+async function searchTickers(q){
   try {
-    const url = PROXY + encodeURIComponent(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&newsCount=0&quotesCount=8`);
-    const r = await fetch(url);
+    const r = await fetch(`https://finnhub.io/api/v1/search?q=${encodeURIComponent(q)}&token=${FINNHUB_KEY}`);
     const d = await r.json();
-    return (d.quotes||[]).filter(x=>x.quoteType&&['EQUITY','ETF','CRYPTOCURRENCY','MUTUALFUND'].includes(x.quoteType)).slice(0,8).map(x=>({
+    return (d.result||[]).slice(0,8).map(x=>({
       ticker: x.symbol,
-      name: x.shortname || x.longname || x.symbol,
-      type: x.quoteType
+      name: x.description,
+      type: x.type
     }));
   } catch(e){ return []; }
 }
@@ -557,25 +542,16 @@ async function renderPortfolio(){
 holdings.forEach((h,i)=>{
   const q = prices[i];
   const price = q?.price || 0;
-  const splitMult = q?.splitMultiplier || 1;
+  const totalSpent = h.costBasis;        // actual dollars paid
+  const avgCost = h.shares > 0 ? totalSpent / h.shares : 0;
 
-  // splitMult e.g. 20 for AMZN: CSV has pre-split data
-  // adjShares: what you actually own today (e.g. 0.2104 × 20 = 4.2082)
-  // adjAvgCost: what you effectively paid per share today (e.g. $3452 ÷ 20 = $172.64)
-  // totalCost: actual dollars spent — never changes with splits
-  const adjShares = h.shares * splitMult;
-  const totalSpent = h.costBasis; // raw dollars from CSV, correct regardless of splits
-  const adjAvgCost = adjShares > 0 ? totalSpent / adjShares : 0;
-
-  h.adjShares = adjShares;
-  h.adjAvgCost = adjAvgCost;
-  h.totalSpent = totalSpent;
   h.currentPrice = price;
-  h.currentValue = price * adjShares;
+  h.currentValue = price * h.shares;
+  h.adjAvgCost = avgCost;
+  h.adjShares = h.shares;
   h.gainLoss = h.currentValue - totalSpent;
   h.gainPct = totalSpent > 0 ? (h.gainLoss / totalSpent) * 100 : 0;
-  h.todayChangeDollars = (q?.change || 0) * adjShares;
-  h.todayChangePct = q?.changePct || 0;
+  h.todayChangeDollars = (q?.change || 0) * h.shares;
 
   totalValue += h.currentValue;
   totalCost += totalSpent;
@@ -858,7 +834,7 @@ async function onTickerSearch(){
   clearTimeout(searchDebounce);
   if(q.length < 1){ document.getElementById('ticker-results').classList.remove('open'); return; }
   searchDebounce = setTimeout(async()=>{
-    const results = await searchYahoo(q);
+    const results = await searchTickers(q);
     const el = document.getElementById('ticker-results');
     if(!results.length){ el.classList.remove('open'); return; }
     el.innerHTML = results.map(r=>`
@@ -906,7 +882,20 @@ function submitTx(){
     const h = getHoldings().find(x=>x.ticker===ticker);
     if(!h || h.shares < shares){ showToast("Can't sell more shares than you own", 'error'); return; }
   }
-  transactions.push({id:Date.now(), type, ticker, name, shares, price, date: date||new Date().toISOString().split('T')[0]});
+  let mult = 1;
+  try {
+    const r = await fetch(`https://finnhub.io/api/v1/stock/split?symbol=${encodeURIComponent(ticker)}&from=2000-01-01&to=${new Date().toISOString().split('T')[0]}&token=${FINNHUB_KEY}`);
+    const d = await r.json();
+    (d||[]).forEach(s => { mult *= (s.toFactor / s.fromFactor); });
+  } catch(e){}
+
+  transactions.push({
+    id:Date.now(), type, ticker, name,
+    shares: shares * mult,
+    price: price / mult,
+    date: date||new Date().toISOString().split('T')[0],
+    splitAdjusted: true
+  });
   save();
   closeTxModal();
   showToast(`${type==='buy'?'Bought':'Sold'} ${shares} ${ticker}`, 'success');
@@ -1008,12 +997,38 @@ function handleCSV(file){
   reader.readAsText(file);
 }
 
-function confirmImport(){
+async function confirmImport(){
   if(!pendingImport.length) return;
-  transactions = [...transactions, ...pendingImport];
+  showToast('Adjusting for stock splits…', 'success');
+
+  // group by ticker to fetch splits once per ticker
+  const tickers = [...new Set(pendingImport.map(t=>t.ticker))];
+  const splitMap = {};
+  await Promise.all(tickers.map(async ticker => {
+    try {
+      const r = await fetch(`https://finnhub.io/api/v1/stock/split?symbol=${encodeURIComponent(ticker)}&from=2000-01-01&to=${new Date().toISOString().split('T')[0]}&token=${FINNHUB_KEY}`);
+      const d = await r.json();
+      let mult = 1;
+      (d||[]).forEach(s => { mult *= (s.toFactor / s.fromFactor); });
+      splitMap[ticker] = mult;
+    } catch(e){ splitMap[ticker] = 1; }
+  }));
+
+  // apply split adjustment to each transaction before saving
+  const adjusted = pendingImport.map(tx => {
+    const mult = splitMap[tx.ticker] || 1;
+    return {
+      ...tx,
+      shares: tx.shares * mult,
+      price: tx.price / mult,
+      splitAdjusted: true
+    };
+  });
+
+  transactions = [...transactions, ...adjusted];
   save();
   closeImportModal();
-  showToast(`Imported ${pendingImport.length} transactions`, 'success');
+  showToast(`Imported ${adjusted.length} transactions (split-adjusted)`, 'success');
   renderPortfolio();
 }
 
@@ -1023,7 +1038,7 @@ function onHeaderSearch(){
   clearTimeout(headerSearchDebounce);
   if(q.length < 1){ document.getElementById('header-dropdown').classList.remove('open'); return; }
   headerSearchDebounce = setTimeout(async()=>{
-    const results = await searchYahoo(q);
+    const results = await searchTickers(q);
     const drop = document.getElementById('header-dropdown');
     if(!results.length){ drop.classList.remove('open'); return; }
     drop.innerHTML = results.map(r=>`
