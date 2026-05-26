@@ -470,6 +470,7 @@ function getAvgCost(ticker){
 
 // ─── YAHOO FINANCE PROXY ─────────────────────────────────────────────────────
 const FINNHUB_KEY = 'd8auq31r01qk20sotit0d8auq31r01qk20sotitg';
+const YF_PROXY = 'https://corsproxy.io/?url=';
 
 async function fetchQuote(ticker){
   const now = Date.now();
@@ -477,15 +478,13 @@ async function fetchQuote(ticker){
     return priceCache[ticker];
   }
   try {
-    // price data from Finnhub
     const [fRes, yRes] = await Promise.all([
       fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(ticker)}&token=${FINNHUB_KEY}`),
-      fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5d`)
+      fetch(YF_PROXY + encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5d`))
     ]);
     const f = await fRes.json();
     const y = await yRes.json();
     const meta = y.chart?.result?.[0]?.meta;
-
     if(!f || f.c === undefined) return null;
     const quote = {
       price: f.c,
@@ -506,13 +505,13 @@ async function fetchHistory(ticker, range){
   const rangeMap = {'1W':'5d','1M':'1mo','3M':'3mo','1Y':'1y','ALL':'5y'};
   const intMap = {'1W':'1d','1M':'1d','3M':'1d','1Y':'1wk','ALL':'1mo'};
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${intMap[range]||'1d'}&range=${rangeMap[range]||'5d'}`;
+    const url = YF_PROXY + encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${intMap[range]||'1d'}&range=${rangeMap[range]||'5d'}`);
     const r = await fetch(url);
     const d = await r.json();
     const result = d.chart?.result?.[0];
     if(!result) return [];
     const ts = result.timestamp || [];
-    const closes = result.indicators?.quote?.[0]?.close || [];
+    const closes = result.indicators?.adjclose?.[0]?.adjclose || result.indicators?.quote?.[0]?.close || [];
     return ts.map((t,i) => ({t: new Date(t*1000), v: closes[i]||null})).filter(x=>x.v!==null);
   } catch(e){ return []; }
 }
@@ -891,20 +890,34 @@ async function submitTx(){
     const h = getHoldings().find(x=>x.ticker===ticker);
     if(!h || h.shares < shares){ showToast("Can't sell more shares than you own", 'error'); return; }
   }
-  let mult = 1;
-  try {
-    const r = await fetch(`https://finnhub.io/api/v1/stock/split?symbol=${encodeURIComponent(ticker)}&from=2000-01-01&to=${new Date().toISOString().split('T')[0]}&token=${FINNHUB_KEY}`);
-    const d = await r.json();
-    (d||[]).forEach(s => { mult *= (s.toFactor / s.fromFactor); });
-  } catch(e){}
-
-  transactions.push({
-    id:Date.now(), type, ticker, name,
-    shares: shares * mult,
-    price: price / mult,
-    date: date||new Date().toISOString().split('T')[0],
-    splitAdjusted: true
-  });
+  let adjPrice = price;
+try {
+  const url = YF_PROXY + encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=max`);
+  const r = await fetch(url);
+  const d = await r.json();
+  const result = d.chart?.result?.[0];
+  if(result){
+    const ts = result.timestamp || [];
+    const adjclose = result.indicators?.adjclose?.[0]?.adjclose || [];
+    const close = result.indicators?.quote?.[0]?.close || [];
+    const map = {};
+    ts.forEach((t,i) => {
+      const dateStr = new Date(t*1000).toISOString().split('T')[0];
+      map[dateStr] = adjclose[i] || close[i] || null;
+    });
+    const dates = Object.keys(map).sort();
+    const match = dates.find(d => d >= date) || dates[dates.length-1];
+    if(map[match]) adjPrice = map[match];
+  }
+} catch(e){}
+const totalSpent = shares * price;
+transactions.push({
+  id:Date.now(), type, ticker, name,
+  shares: totalSpent / adjPrice,
+  price: adjPrice,
+  date: date||new Date().toISOString().split('T')[0],
+  splitAdjusted: true
+});
   save();
   closeTxModal();
   showToast(`${type==='buy'?'Bought':'Sold'} ${shares} ${ticker}`, 'success');
@@ -1008,28 +1021,48 @@ function handleCSV(file){
 
 async function confirmImport(){
   if(!pendingImport.length) return;
-  showToast('Adjusting for stock splits…', 'success');
+  showToast('Fetching split-adjusted prices…', 'success');
 
-  // group by ticker to fetch splits once per ticker
   const tickers = [...new Set(pendingImport.map(t=>t.ticker))];
-  const splitMap = {};
+
+  // fetch max range adjclose from Yahoo for each ticker to get split-adjusted historical prices
+  const adjPriceMap = {};
   await Promise.all(tickers.map(async ticker => {
     try {
-      const r = await fetch(`https://finnhub.io/api/v1/stock/split?symbol=${encodeURIComponent(ticker)}&from=2000-01-01&to=${new Date().toISOString().split('T')[0]}&token=${FINNHUB_KEY}`);
+      const url = YF_PROXY + encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=max`);
+      const r = await fetch(url);
       const d = await r.json();
-      let mult = 1;
-      (d||[]).forEach(s => { mult *= (s.toFactor / s.fromFactor); });
-      splitMap[ticker] = mult;
-    } catch(e){ splitMap[ticker] = 1; }
+      const result = d.chart?.result?.[0];
+      if(!result) return;
+      const ts = result.timestamp || [];
+      const adjclose = result.indicators?.adjclose?.[0]?.adjclose || [];
+      const close = result.indicators?.quote?.[0]?.close || [];
+      // build date -> adjclose map
+      const map = {};
+      ts.forEach((t,i) => {
+        const dateStr = new Date(t*1000).toISOString().split('T')[0];
+        map[dateStr] = adjclose[i] || close[i] || null;
+      });
+      adjPriceMap[ticker] = map;
+    } catch(e){}
   }));
 
-  // apply split adjustment to each transaction before saving
   const adjusted = pendingImport.map(tx => {
-    const mult = splitMap[tx.ticker] || 1;
+    const map = adjPriceMap[tx.ticker];
+    if(!map) return tx;
+    // find closest trading date at or after tx date
+    const txDate = tx.date;
+    const dates = Object.keys(map).sort();
+    const match = dates.find(d => d >= txDate) || dates[dates.length-1];
+    const adjPrice = map[match];
+    if(!adjPrice || adjPrice <= 0) return tx;
+    // total dollars spent stays the same: tx.shares * tx.price
+    // recalculate as: same dollars / adjPrice = new share count
+    const totalSpent = tx.shares * tx.price;
     return {
       ...tx,
-      shares: tx.shares * mult,
-      price: tx.price / mult,
+      shares: totalSpent / adjPrice,
+      price: adjPrice,
       splitAdjusted: true
     };
   });
