@@ -477,18 +477,27 @@ async function fetchQuote(ticker){
     return priceCache[ticker];
   }
   try {
-    const url = PROXY + encodeURIComponent(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5d`);
+    const base = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5y&events=split%2Cdiv`;
+    const url = PROXY + encodeURIComponent(base);
     const r = await fetch(url);
     const d = await r.json();
     const result = d.chart?.result?.[0];
     if(!result) return null;
     const meta = result.meta;
+
+    // build cumulative split multiplier for pre-split transactions
+    const splits = result.events?.splits ? Object.values(result.events.splits) : [];
+    // splitMultiplier: multiply old prices by this to get current equivalent
+    let splitMultiplier = 1;
+    splits.forEach(s => { splitMultiplier *= (s.numerator / s.denominator); });
+
     const quote = {
       price: meta.regularMarketPrice || meta.previousClose || 0,
       prev: meta.previousClose || meta.chartPreviousClose || 0,
       change: (meta.regularMarketPrice||0) - (meta.previousClose||0),
       changePct: meta.regularMarketChangePercent || 0,
-      name: meta.shortName || meta.longName || ticker
+      name: meta.shortName || meta.longName || ticker,
+      splitMultiplier
     };
     priceCache[ticker] = quote;
     priceCacheTime[ticker] = now;
@@ -546,19 +555,26 @@ async function renderPortfolio(){
   let totalValue = 0, totalCost = 0, todayChange = 0;
 
   const prices = await Promise.all(holdings.map(h => fetchQuote(h.ticker)));
-  holdings.forEach((h,i)=>{
-    const q = prices[i];
-    const price = q?.price || priceCache[h.ticker]?.price || 0;
-    h.currentPrice = price;
-    h.currentValue = price * h.shares;
-    h.avgCost = h.shares > 0 ? h.costBasis / h.shares : 0;
-    h.gainLoss = h.currentValue - h.costBasis;
-    h.gainPct = h.avgCost > 0 ? ((price - h.avgCost) / h.avgCost) * 100 : 0;
-    h.todayChange = (q?.change || 0) * h.shares;
-    totalValue += h.currentValue;
-    totalCost += h.costBasis;
-    todayChange += h.todayChange;
-  });
+holdings.forEach((h,i)=>{
+  const q = prices[i];
+  const price = q?.price || priceCache[h.ticker]?.price || 0;
+  const splitMult = q?.splitMultiplier || 1;
+
+  // adjust cost basis for splits: old price / splitMult = split-adjusted equivalent
+  const adjustedCostBasis = h.costBasis / splitMult;
+  const adjustedShares = h.shares * splitMult;
+
+  h.currentPrice = price;
+  h.currentValue = price * adjustedShares;
+  h.shares = adjustedShares;
+  h.avgCost = adjustedShares > 0 ? adjustedCostBasis / adjustedShares : 0;
+  h.gainLoss = h.currentValue - adjustedCostBasis;
+  h.gainPct = h.avgCost > 0 ? ((price - h.avgCost) / h.avgCost) * 100 : 0;
+  h.todayChange = (q?.change || 0) * adjustedShares;
+  totalValue += h.currentValue;
+  totalCost += adjustedCostBasis;
+  todayChange += h.todayChange;
+});
 
   const totalGain = totalValue - totalCost;
   const totalGainPct = totalCost > 0 ? (totalGain / totalCost) * 100 : 0;
@@ -702,8 +718,12 @@ async function openDetail(ticker){
   iconEl.style.color = COLORS[colorIdx];
   iconEl.textContent = ticker.slice(0,3);
 
-  document.getElementById('detail-shares').textContent = h ? h.shares.toFixed(4) : '0';
-  document.getElementById('detail-avg').textContent = h ? '$' + avgCost.toFixed(2) : '—';
+  const q2 = priceCache[ticker];
+  const splitMult = q2?.splitMultiplier || 1;
+  const adjShares = h ? h.shares * splitMult : 0;
+  const adjAvg = h ? (h.costBasis / splitMult) / adjShares : 0;
+  document.getElementById('detail-shares').textContent = h ? adjShares.toFixed(4) : '0';
+  document.getElementById('detail-avg').textContent = h ? '$' + adjAvg.toFixed(2) : '—';
 
   const allTx = transactions.filter(t=>t.ticker===ticker);
   document.getElementById('detail-tx-list').innerHTML = allTx.length ? allTx.slice().reverse().map(tx=>`
