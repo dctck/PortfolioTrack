@@ -469,7 +469,7 @@ function getAvgCost(ticker){
 }
 
 // ─── YAHOO FINANCE PROXY ─────────────────────────────────────────────────────
-const PROXY = 'https://api.allorigins.win/raw?url=';
+const PROXY = 'https://corsproxy.io/?url=';
 
 async function fetchQuote(ticker){
   const now = Date.now();
@@ -477,7 +477,7 @@ async function fetchQuote(ticker){
     return priceCache[ticker];
   }
   try {
-    const base = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=5d&events=split`;
+    const base = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=max&events=split`;
     const url = PROXY + encodeURIComponent(base);
     const r = await fetch(url);
     const d = await r.json();
@@ -485,7 +485,7 @@ async function fetchQuote(ticker){
     if(!result) return null;
     const meta = result.meta;
 
-    // cumulative split ratio since IPO: multiply CSV shares by this, divide CSV prices by this
+    // get ALL splits and compute total cumulative multiplier
     const splits = result.events?.splits ? Object.values(result.events.splits) : [];
     let splitMultiplier = 1;
     splits.forEach(s => { splitMultiplier *= (s.numerator / s.denominator); });
@@ -559,41 +559,51 @@ holdings.forEach((h,i)=>{
   const price = q?.price || 0;
   const splitMult = q?.splitMultiplier || 1;
 
-  // adjust: CSV has pre-split shares/prices, convert to post-split equivalent
-  h.adjShares = h.shares * splitMult;
-  h.adjAvgCost = h.adjShares > 0 ? (h.costBasis / splitMult) / h.adjShares : 0;
+  // splitMult e.g. 20 for AMZN: CSV has pre-split data
+  // adjShares: what you actually own today (e.g. 0.2104 × 20 = 4.2082)
+  // adjAvgCost: what you effectively paid per share today (e.g. $3452 ÷ 20 = $172.64)
+  // totalCost: actual dollars spent — never changes with splits
+  const adjShares = h.shares * splitMult;
+  const totalSpent = h.costBasis; // raw dollars from CSV, correct regardless of splits
+  const adjAvgCost = adjShares > 0 ? totalSpent / adjShares : 0;
 
+  h.adjShares = adjShares;
+  h.adjAvgCost = adjAvgCost;
+  h.totalSpent = totalSpent;
   h.currentPrice = price;
-  h.currentValue = price * h.adjShares;
-  h.gainLoss = h.currentValue - (h.adjAvgCost * h.adjShares);
-  h.gainPct = h.adjAvgCost > 0 ? ((price - h.adjAvgCost) / h.adjAvgCost) * 100 : 0;
-  h.todayChange = (q?.change || 0) * h.adjShares;
+  h.currentValue = price * adjShares;
+  h.gainLoss = h.currentValue - totalSpent;
+  h.gainPct = totalSpent > 0 ? (h.gainLoss / totalSpent) * 100 : 0;
+  h.todayChangeDollars = (q?.change || 0) * adjShares;
   h.todayChangePct = q?.changePct || 0;
 
   totalValue += h.currentValue;
-  totalCost += h.adjAvgCost * h.adjShares;
-  todayChange += h.todayChange;
+  totalCost += totalSpent;
+  todayChange += h.todayChangeDollars;
 });
 
-  const totalGain = totalValue - totalCost;
-  const totalGainPct = totalCost > 0 ? (totalGain / totalCost) * 100 : 0;
-
+  // Portfolio value = current market value of all holdings
   document.getElementById('total-value').textContent = '$' + totalValue.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   document.getElementById('total-invested-sub').textContent = '$' + totalCost.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) + ' invested';
 
+  // Total gain = market value − what you actually paid
+  const totalGain = totalValue - totalCost;
+  const totalGainPct = totalCost > 0 ? (totalGain / totalCost) * 100 : 0;
   const gainEl = document.getElementById('total-gain');
   gainEl.textContent = (totalGain>=0?'+':'') + '$' + Math.abs(totalGain).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   gainEl.className = 'stat-value ' + (totalGain>=0?'up':'down');
   document.getElementById('total-gain-pct').textContent = (totalGainPct>=0?'+':'') + totalGainPct.toFixed(2) + '%';
 
+  // Today's change = sum of (day change per share × shares held) across all holdings
   const todayEl = document.getElementById('today-change');
-  if(holdings.length === 0 || transactions.length === 0){
+  if(!holdings.length){
     todayEl.textContent = '—';
     todayEl.className = 'stat-value';
   } else {
     todayEl.textContent = (todayChange>=0?'+':'') + '$' + Math.abs(todayChange).toFixed(2);
     todayEl.className = 'stat-value ' + (todayChange>=0?'up':'down');
   }
+
   document.getElementById('holding-count').textContent = holdings.length;
 
   renderHoldings(holdings);
@@ -621,7 +631,7 @@ function renderHoldings(holdings){
       </div></td>
       <td class="h-num">${h.adjShares.toFixed(4)}</td>
       <td class="h-num">$${h.adjAvgCost.toFixed(2)}</td>
-      <td class="h-num">$${(h.currentPrice||0).toFixed(2)}</td>
+      <td class="h-num">$${h.currentPrice.toFixed(2)}</td>
       <td class="h-num" style="font-weight:500">$${h.currentValue.toFixed(2)}</td>
       <td class="h-num"><span class="${gainCls}">${h.gainLoss>=0?'+':''}$${Math.abs(h.gainLoss).toFixed(2)}</span></td>
       <td class="h-num"><span class="badge ${pctCls}">${h.gainPct>=0?'+':''}${h.gainPct.toFixed(2)}%</span></td>
@@ -723,9 +733,10 @@ async function openDetail(ticker){
   iconEl.textContent = ticker.slice(0,3);
 
   const q2 = await fetchQuote(ticker);
-  const splitMult = q2?.splitMultiplier || 1;
+  const splitMult = q?.splitMultiplier || 1;
   const adjShares = h ? h.shares * splitMult : 0;
-  const adjAvg = h && adjShares > 0 ? (h.costBasis / splitMult) / adjShares : 0;
+  const totalSpent = h ? h.costBasis : 0;
+  const adjAvg = adjShares > 0 ? totalSpent / adjShares : 0;
   document.getElementById('detail-shares').textContent = adjShares > 0 ? adjShares.toFixed(4) : '0';
   document.getElementById('detail-avg').textContent = adjAvg > 0 ? '$' + adjAvg.toFixed(2) : '—';
 
